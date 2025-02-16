@@ -1,93 +1,93 @@
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
-import boto3
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 import os
 import time
 import threading
-import requests 
+import requests
+import logging
+from typing import Generator
+from aws_manager import AWSManager
+from config import MAX_ELASTIC_IPS, HEALTH_CHECK_INTERVAL, IP_CHECK_INTERVAL
+
 app = Flask(__name__)
 CORS(app)
+limiter = Limiter(app, key_func=get_remote_address)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 stop_allocation = False
-allocated_ips = []
-desired_ips = [
-    '43.204.22','43.204.25', '43.204.24', '43.204.23', '43.204.28', '43.204.30',  
-    '43.205.232', '43.205.113', '43.205.207', '43.205.178', '43.205.126', '43.205.124', '43.205.113', 
-    '43.205.208', '43.205.191', '43.205.94', '43.205.228', '43.205.210', '43.205.191', '43.205.120', '43.205.238', '43.205.207', '43.205.110', '43.205.121', 
-    '43.205.107', '43.205.123', '43.205.92', '43.205.213', '43.205.217', '43.205.130', '43.205.220', '43.205.194', '43.205.178', 
-    '43.205.210', '43.205.111', '43.205.215', '43.205.253', '43.205.49', '43.205.52', '43.205.153', '43.205.50', 
-    '43.205.94', '43.205.208', '43.205.217', '43.205.142', '43.205.146'
-]
-my_dict = {}
-def manage_elastic_ips(aws_access_key_id,aws_secret_access_key,region_name):
+aws_manager = None
+
+def manage_elastic_ips(aws_manager: AWSManager) -> Generator[str, None, None]:
     while not stop_allocation:
-        session = boto3.Session(
-            aws_access_key_id=aws_access_key_id,
-            aws_secret_access_key=aws_secret_access_key,
-            region_name=region_name
-        )
+        try:
+            elastic_ips = aws_manager.get_elastic_ips()
+            matched_ips = []
 
-        ec2 = session.client('ec2')
-        response = ec2.describe_addresses()
-        elastic_ips = [[address.get('PublicIp'), address.get('AllocationId')] for address in response.get('Addresses', [])]
-        matched_ips = []
+            for ip_data in elastic_ips[:]:
+                public_ip, allocation_id = ip_data
+                if aws_manager.is_desired_ip(public_ip):
+                    if public_ip not in aws_manager.allocated_ips:
+                        logger.info(f"Allocated: {public_ip}")
+                        yield f"Allocated {public_ip}"
+                        aws_manager.allocated_ips[public_ip] = allocation_id
+                    matched_ips.append(ip_data)
+                    elastic_ips.remove(ip_data)
 
-        for ip_data in elastic_ips[:]:  
-            public_ip = ip_data[0]
-            ip_prefix = '.'.join(public_ip.split('.')[:3])
-            if ip_prefix in desired_ips:
-                if public_ip in my_dict:
-                    print("HII")
-                else:
-                    print(f"Allocated : {public_ip}")
+            # Release excess IPs
+            if len(elastic_ips) + len(matched_ips) >= MAX_ELASTIC_IPS:
+                for _, allocation_id in elastic_ips:
+                    aws_manager.release_ip(allocation_id)
+                elastic_ips = []
+
+            # Allocate new IPs if needed
+            while len(elastic_ips) + len(matched_ips) < MAX_ELASTIC_IPS:
+                public_ip, allocation_id = aws_manager.allocate_ip()
+                if aws_manager.is_desired_ip(public_ip):
+                    matched_ips.append([public_ip, allocation_id])
                     yield f"Allocated {public_ip}"
-                    my_dict[public_ip]=1
-                matched_ips.append(ip_data)  
-                elastic_ips.remove(ip_data)
+                else:
+                    elastic_ips.append([public_ip, allocation_id])
+                    yield f"Suggested {public_ip}"
 
-        if len(elastic_ips) + len(matched_ips) >= 5:
-            for ip_data in elastic_ips[:]:  
-                ec2.release_address(AllocationId=ip_data[1])   
-            elastic_ips = []  
+            # Release undesired IPs
+            for _, allocation_id in elastic_ips:
+                aws_manager.release_ip(allocation_id)
 
-        while len(elastic_ips) + len(matched_ips) < 5:
-            allocation_response = ec2.allocate_address(Domain='vpc')  # Allocate Elastic IP for VPC
-            new_ip_data = [allocation_response.get('PublicIp'), allocation_response.get('AllocationId')]
-            public_ip = allocation_response.get('PublicIp')
-            ip_prefix = '.'.join(public_ip.split('.')[:3])
-            if ip_prefix in desired_ips:
-                print(f"Allocated : {allocation_response.get('PublicIp')}")
-                yield f"Allocated {allocation_response.get('PublicIp')}"
-                matched_ips.append(new_ip_data)  
-            else:
-                elastic_ips.append(new_ip_data)
-                print(f"Suggested : {allocation_response.get('PublicIp')}")
-                yield f"Suggested {allocation_response.get('PublicIp')}"
-        for ip_data in elastic_ips[:]:  
-            ec2.release_address(AllocationId=ip_data[1])   
-        elastic_ips = []
-        time.sleep(60)
-
-
+            time.sleep(IP_CHECK_INTERVAL)
+        except Exception as e:
+            logger.error(f"Error in IP management: {e}")
+            yield f"Error: {str(e)}"
+            time.sleep(5)
 
 @app.route('/allocate-ip', methods=['POST'])
+@limiter.limit("5 per minute")
 def allocate_ip():
-    
-    global stop_allocation
-    stop_allocation = False
+    try:
+        global stop_allocation, aws_manager
+        stop_allocation = False
 
-    data = request.json
-    aws_access_key_id = data['aws_access_key_id']
-    aws_secret_access_key = data['aws_secret_access_key']
-    region_name=data['region_name']
-    return Response(manage_elastic_ips(aws_access_key_id,aws_secret_access_key,region_name), content_type='text/plain')
+        data = request.json
+        if not all(key in data for key in ['aws_access_key_id', 'aws_secret_access_key', 'region_name']):
+            return jsonify({'error': 'Missing required parameters'}), 400
+
+        aws_manager = AWSManager(
+            data['aws_access_key_id'],
+            data['aws_secret_access_key'],
+            data['region_name']
+        )
+        return Response(manage_elastic_ips(aws_manager), content_type='text/plain')
+    except Exception as e:
+        logger.error(f"Error in allocation: {e}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/stop', methods=['POST'])
 def stop_allocation_route():
     global stop_allocation
     stop_allocation = True
-    return jsonify({'status': 'PROCESS STOPPED'})
-
 @app.route('/fetch_regions', methods=['GET'])
 def fetch_regions():
     session = boto3.session.Session()
