@@ -88,6 +88,8 @@ def allocate_ip():
 def stop_allocation_route():
     global stop_allocation
     stop_allocation = True
+    return jsonify({'status': 'PROCESS STOPPED'})
+
 @app.route('/fetch_regions', methods=['GET'])
 def fetch_regions():
     session = boto3.session.Session()
@@ -97,30 +99,20 @@ def fetch_regions():
         regions.append(region)
     return regions
 
-
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({'status': 'BACKEND SERVER FOR AWS TOOL IS STARTED'})
 
+def health_check():
+    while True:
+        try:
+            response = requests.get('https://backend-ip-2.onrender.com')
+            logger.info(f'Health check: {response.status_code}')
+        except Exception as e:
+            logger.error(f'Health check failed: {e}')
+        time.sleep(HEALTH_CHECK_INTERVAL)
 
-
-def call_api_every_10_seconds():
-        while True:
-            # Replace this URL with the API endpoint you want to call
-            url = 'https://backend-ip-2.onrender.com'
-            try:
-                response = requests.get(url)
-                if response.status_code == 200:
-                    print('API call successful:', response.json())
-                else:
-                    print('API call failed with status code:', response.status_code)
-            except Exception as e:
-                print('Error during API call:', e)
-    
-            time.sleep(10)  # Wait for 10 seconds
-    
-    # Start the background thread
-threading.Thread(target=call_api_every_10_seconds, daemon=True).start()
 if __name__ == '__main__':
+    threading.Thread(target=health_check, daemon=True).start()
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
