@@ -1,0 +1,48 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "AWS IP Allocation API",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/allocate-ip": {
+      "post": {
+        "summary": "Allocate Elastic IPs",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AWSCredentials"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "IP allocation stream"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AWSCredentials": {
+        "type": "object",
+        "properties": {
+          "aws_access_key_id": {
+            "type": "string"
+          },
+          "aws_secret_access_key": {
+            "type": "string"
+          },
+          "region_name": {
+            "type": "string"
+          }
+        },
+        "required": ["aws_access_key_id", "aws_secret_access_key", "region_name"]
+      }
+    }
+  }
+}
